@@ -1,0 +1,169 @@
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -867,6 +867,8 @@
+         """Start the pinned lookup while the preceding decoder layer runs."""
+         embedding = self.ngram_embedding
+         if not embedding.supports_prefetch:
++            if getattr(embedding, "_mbx_name", None) in _OPT_ASYNC:   # OPT: start the table read one layer early
++                _opt_ple_prefetch_eager(self, input_ids, query_start_loc, ngram_context, embedding._mbx_name)
+             return
+         ngram_ids = self.compute_ngram_ids(
+             input_ids,
+@@ -1368,6 +1370,8 @@
+     if layer._mbx_t_fd < 0:
+         raise RuntimeError("PLE: map open failed")
+     print(f"PLE: map ready ({'reused' if reuse else f'built in {_time.time() - t0:.0f} s'})", flush=True)
++    if _mbx_os.environ.get("OPT_PLE_ASYNC", "0") == "1":
++        _opt_ple_async_init(layer)
+ 
+ 
+ def _mbx_t_gather(layer, ids: torch.Tensor):
+@@ -1387,6 +1391,12 @@
+ def _mbx_t_gather_impl(ids: torch.Tensor, packed_out: torch.Tensor, scales_out: torch.Tensor, layer_name: str) -> None:
+     layer = _MBX_T_LAYERS[layer_name]
+     ids = torch.clamp(ids, 0, layer._mbx_mm_S * layer._mbx_mm_n - 1)
++    A = _OPT_ASYNC.get(layer_name)
++    if A is not None and ids.is_cuda and not _opt_in_capture() and ids.numel() <= A.max_n:
++        _opt_ple_gather_async(A, ids, packed_out, scales_out)
++        return
++    if A is not None:
++        A.lib.opt_ple_drain()   # the worker and this thread must not use the table library at the same time
+     if _mbx_t_mode() == "mmap" or (ids.is_cuda and torch.cuda.is_current_stream_capturing()):
+         pk, sc = _mbx_mmap_gather(layer, ids)
+     else:
+@@ -1402,6 +1412,135 @@
+     _mbx_t_gather_eager = _mbx_t_gather_impl
+ 
+ 
++# ---- OPT: asynchronous table reads (libopt_ple_async.so) -----------------------------------------------------------
++# The synchronous read (ids.cpu() -> np.unique -> NVMe -> pageable H2D) stalls the CPU on the GPU every forward and
++# leaves the GPU idle during the read. Here a native worker thread does the same read off the main thread; the GPU
++# waits on a flag word (cuStreamWaitValue32) only if the rows have not landed yet, and the read is started one layer
++# early from the prefetch hook. Same rows, same order, same dequant: the outputs are bit-identical.
++_OPT_ASYNC = {}
++
++
++class _OptPleAsync:
++    pass
++
++
++def _opt_ple_async_init(layer) -> None:
++    import ctypes as _c
++    try:
++        from vllm.config import get_current_vllm_config
++        mbt = int(get_current_vllm_config().scheduler_config.max_num_batched_tokens)
++    except Exception:  # noqa: BLE001
++        mbt = 8192
++    A = _OptPleAsync()
++    A.max_n = mbt * 64
++    cp, cs = layer._mbx_mm_cols_p, layer._mbx_mm_cols_s
++    # pinned (mapped) host buffers: the GPU copies ids in and rows out, and waits on data_flag; the worker never
++    # calls CUDA
++    A.pin_ids = torch.zeros(A.max_n, dtype=torch.int64, pin_memory=True)
++    A.pin_pk = torch.zeros((A.max_n, cp), dtype=torch.uint8, pin_memory=True)
++    A.pin_sc = torch.zeros((A.max_n, max(cs, 1)), dtype=torch.uint8, pin_memory=True)
++    A.ids_flag = torch.zeros(16, dtype=torch.int32, pin_memory=True)
++    A.data_flag = torch.zeros(16, dtype=torch.int32, pin_memory=True)
++    A.seq = 0
++    A.pending = None
++    A.checks = 3
++    A.prefetch = _mbx_os.environ.get("OPT_PLE_PREFETCH", "1") == "1"
++    A.verify = int(_mbx_os.environ.get("OPT_PLE_VERIFY", "0"))
++    A.verified = A.mismatch = 0
++    lib = _c.CDLL(_mbx_os.environ.get("OPT_PLE_ASYNC_LIB", "/opt/mbx/lib/libopt_ple_async.so"))
++    lib.opt_ple_init.argtypes = [_c.c_char_p, _c.c_int, _c.c_int, _c.c_int, _c.c_int, _c.c_int,
++                                 _c.c_uint64, _c.c_uint64, _c.c_uint64, _c.c_uint64, _c.c_uint64]
++    lib.opt_ple_submit.argtypes = [_c.c_uint64, _c.c_int, _c.c_uint32]
++    lib.opt_ple_wait.argtypes = [_c.c_uint64, _c.c_uint32]
++    lib.opt_ple_read_us.restype = _c.c_double
++    lib.opt_ple_jobs.restype = _c.c_long
++    _mbx_t_lib()   # make sure the table library is loaded and its queue opened
++    threads = 0 if _MBX_T.get("q") else int(_mbx_os.environ.get("MBX_PLE_NVME_THREADS", "32"))
++    rc = lib.opt_ple_init(_mbx_os.environ.get("MBX_PLE_LIB", "/opt/mbx/lib/libmbx_ple_nvme.so").encode(),
++                          layer._mbx_t_fd, cp, cs, A.max_n, threads, A.pin_ids.data_ptr(), A.pin_pk.data_ptr(),
++                          A.pin_sc.data_ptr(), A.ids_flag.data_ptr(), A.data_flag.data_ptr())
++    if rc:
++        print(f"OPT PLE async: init failed ({rc}), keeping the synchronous reader", flush=True)
++        return
++    A.lib = lib
++    A.layer = layer
++    _OPT_ASYNC[layer._mbx_name] = A
++    print(f"OPT PLE async: on (max {A.max_n} ids, prefetch {'on' if A.prefetch else 'off'})", flush=True)
++
++
++def _opt_in_capture() -> bool:
++    """True while CUDA graphs are being captured (startup): the synchronous reader is used there; replays are async."""
++    if torch.cuda.is_current_stream_capturing():
++        return True
++    try:
++        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
++        return BreakableCUDAGraphCapture.current() is not None
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def _opt_ple_submit(A, ids: torch.Tensor) -> int:
++    n = ids.numel()
++    A.pin_ids[:n].copy_(ids.reshape(-1), non_blocking=True)          # D2H on the compute stream
++    A.seq = (A.seq + 1) & 0x7FFFFFFF
++    if A.lib.opt_ple_submit(torch.cuda.current_stream().cuda_stream, n, A.seq):
++        raise RuntimeError("OPT PLE async: submit failed")
++    return A.seq
++
++
++def _opt_ple_gather_async(A, ids, packed_out, scales_out) -> None:
++    n = ids.numel()
++    pend, A.pending = A.pending, None
++    if pend is not None and pend[1] == n:
++        seq = pend[0]
++        if A.checks > 0:   # startup self-check: the prefetched ids must be the ids the layer asks for
++            A.checks -= 1
++            if not torch.equal(A.pin_ids[:n], ids.reshape(-1).to(torch.int64).cpu()):
++                A.prefetch = False
++                print("OPT PLE async: prefetched ids differ from the layer's ids, prefetch disabled", flush=True)
++                seq = _opt_ple_submit(A, ids)
++    else:
++        seq = _opt_ple_submit(A, ids)
++    if A.lib.opt_ple_wait(torch.cuda.current_stream().cuda_stream, seq):
++        raise RuntimeError("OPT PLE async: wait failed")
++    packed_out.copy_(A.pin_pk[:n].view(packed_out.shape), non_blocking=True)                     # H2D after the wait
++    scales_out.copy_(A.pin_sc[:n, : scales_out.shape[-1]].view(torch.float8_e4m3fn).view(scales_out.shape),
++                     non_blocking=True)
++    if A.lib.opt_ple_failed():
++        raise RuntimeError("OPT PLE async: a table read failed")
++    if A.verify > 0:   # debug: compare with the synchronous reader, byte for byte (syncs; first N gathers only)
++        A.verify -= 1
++        torch.cuda.current_stream().synchronize()
++        A.lib.opt_ple_drain()
++        pk_ref, sc_ref = _mbx_t_gather(A.layer, ids)
++        ok = torch.equal(packed_out.cpu(), pk_ref.view(packed_out.shape)) and torch.equal(
++            scales_out.view(torch.uint8).cpu(), sc_ref.view(torch.uint8).view(scales_out.shape))
++        A.verified += 1
++        A.mismatch += 0 if ok else 1
++        if not ok or A.verify == 0:
++            print(f"OPT PLE async verify: {A.verified} gathers checked, {A.mismatch} mismatches (n={n})", flush=True)
++
++
++def _opt_ple_prefetch_impl(mod, input_ids, query_start_loc, ngram_context, layer_name) -> None:
++    A = _OPT_ASYNC.get(layer_name)
++    if A is None:
++        return
++    A.pending = None
++    if not A.prefetch or _opt_in_capture():
++        return
++    ids = mod.compute_ngram_ids(input_ids, query_start_loc, ngram_context).reshape(-1)
++    if ids.numel() > A.max_n:
++        return
++    ids = torch.clamp(ids, 0, A.layer._mbx_mm_S * A.layer._mbx_mm_n - 1)
++    A.pending = (_opt_ple_submit(A, ids), ids.numel())
++
++
++try:
++    _opt_ple_prefetch_eager = _mbx_eb(_opt_ple_prefetch_impl)
++except Exception:  # noqa: BLE001
++    _opt_ple_prefetch_eager = _opt_ple_prefetch_impl
++
++
+ 
+ # ---- MBX 28: fp8 PLE table (global scale) read from its own folder by the table reader ------------------------------
+ def _mbx_ple_fp8_dir() -> str:

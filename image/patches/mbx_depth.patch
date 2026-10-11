@@ -1,0 +1,275 @@
+--- a/mbx_depth.py
++++ b/mbx_depth.py
+@@ -59,9 +59,26 @@
+     up = c.get("promote", [60, 45]); dn = c.get("demote", [25, 15])
+     _lib().mbx_d_set(int(c.get("min", 3)), D.K, int(c.get("window", 48)),
+                      float(up[0]), float(up[1]), float(dn[0]), float(dn[1]))
+-    D.active = D.mode == "dynamic"
+-    log.info("mbx depth: %s · min %s · max %d · window %s · promote %s · demote %s · log %s",
+-             D.mode, c.get("min", 3), D.K, c.get("window", 48), up, dn, "on" if D.log else "off")
++    D.active = D.mode in ("dynamic", "opt")
++    D.opt = D.mode == "opt"
++    # OPT policy knobs: cost slope per extra draft position, by running requests ([[n, c], ...], linear in n);
++    # EWMA horizon (steps); probe period (steps; 0 = never)
++    # relative step time by running requests and batch depth, measured on this box (fixed-depth sweeps, mixed and
++    # prose prompts averaged): {n: [[d, t], ...]}; interpolated in n and d, linear extrapolation in d
++    st = c.get("steptime") or {"1": [[3, 1.0], [5, 1.195], [7, 1.385]], "4": [[3, 1.0], [5, 1.287], [7, 1.477]],
++                               "16": [[3, 1.0], [5, 1.196], [7, 1.328]]}
++    D.steptime = sorted((float(n), sorted((float(a), float(b)) for a, b in pts)) for n, pts in st.items())
++    D.horizon = float(c.get("horizon", 12))
++    D.probe = int(c.get("probe", 16))
++    D.dmin = max(1, int(c.get("min", 3)))
++    # with at most `single` running requests the shipped per-request policy decides (measured: it is already the best
++    # fixed depth at one stream); the throughput-optimal batch depth takes over above that
++    D.single = int(c.get("single", 1))
++    # OPT: concurrency-aware floor — [[n, d], ...]: with >= n running requests the batch drafts at least d deep
++    # (at high concurrency the batch already reads most experts, so an extra verify token is nearly free)
++    D.floor = sorted((int(a), int(b)) for a, b in (c.get("floor") or []))
++    log.info("mbx depth: %s · min %s · max %d · window %s · promote %s · demote %s · floor %s · log %s",
++             D.mode, c.get("min", 3), D.K, c.get("window", 48), up, dn, D.floor, "on" if D.log else "off")
+ 
+ 
+ def _cfg(sync):
+@@ -97,6 +114,27 @@
+         D.last = [0] * R
+         D.pos = torch.arange(1, K + 1, device=dev, dtype=torch.int32)
+         D.nspec, D.cut_d = {}, K
++        # OPT: sync-free decisions — the GPU computes every row's rates into pinned host memory without blocking;
++        # the next poll consumes them (a 4-step lag). gen[i] bumps whenever row i is reset, so a stale snapshot
++        # of a reused row is never applied to its new request.
++        D.gen = [0] * R
++        D.snap = None
++        D.snap_ptr = torch.zeros(R, dtype=torch.long, pin_memory=True)
++        D.snap_rate = torch.zeros(R, K, dtype=torch.float32, pin_memory=True)
++        D.snap_ev = torch.cuda.Event()
++        # OPT mode: per-request EWMA of P(accepted >= k) over drafted positions only, plus a population prior
++        D.num = torch.zeros(R, K, dtype=torch.float32, device=dev)
++        D.den = torch.zeros(R, K, dtype=torch.float32, device=dev)
++        D.pop_num = torch.tensor([0.85, 0.72, 0.6, 0.5, 0.42, 0.35, 0.29, 0.24, 0.2, 0.17, 0.14, 0.12][:K] +
++                                 [0.1] * max(0, K - 12), dtype=torch.float32, device=dev) * 0.5
++        D.pop_den = torch.full((K,), 0.5, dtype=torch.float32, device=dev)
++        D.opt_rate = torch.zeros(R + 1, K, dtype=torch.float32, pin_memory=True)   # last row: population prior
++        D.opt_ev = torch.cuda.Event()
++        D.opt_pending = False
++        D.opt_gen = [0] * R
++        D.opt_snap_gen = None
++        D.opt_d = K
++        D.opt_live = []
+         D.on = True
+     except Exception as e:
+         D.on = False
+@@ -128,6 +166,7 @@
+ def _reset(i):
+     D.ptr[i] = 0
+     D.last[i] = 0
++    D.gen[i] += 1
+ 
+ 
+ def trim(so, runner=None):
+@@ -137,7 +176,24 @@
+     if not D.active:
+         D.batch = D.drafted = D.K
+         return
+-    if idx is not None:
++    if idx is not None and getattr(D, "opt", False):
++        for r in getattr(so, "scheduled_new_reqs", ()) or ():
++            i = idx.get(r.req_id)
++            if i is not None:
++                D.num[i] = 0.0
++                D.den[i] = 0.0
++                D.opt_gen[i] += 1
++                _set(i, _lib().mbx_d_start())
++                _reset(i)
++        live = D.opt_live = [idx[r] for r in so.num_scheduled_tokens if r in idx]
++        d_opt = _opt_decide()
++        if len(live) <= D.single:
++            held = ctypes.c_int(0)
++            arr = (ctypes.c_int * max(len(live), 1))(*[D.depth[i] for i in live])
++            D.batch = _lib().mbx_d_batch(len(live), arr, ctypes.byref(held))
++        else:
++            D.batch = d_opt
++    elif idx is not None:
+         for r in getattr(so, "scheduled_new_reqs", ()) or ():
+             i = idx.get(r.req_id)
+             if i is not None:
+@@ -147,6 +203,9 @@
+         held = ctypes.c_int(0)
+         arr = (ctypes.c_int * max(len(live), 1))(*[D.depth[i] for i in live])
+         b = _lib().mbx_d_batch(len(live), arr, ctypes.byref(held))
++        for n_min, d_min in getattr(D, "floor", ()):
++            if len(live) >= n_min:
++                b = max(b, min(d_min, D.K))
+         if D.held and not held.value:
+             for i in live:
+                 _reset(i)
+@@ -188,6 +247,8 @@
+         _cfg(sync=True)
+     if not D.active:
+         return
++    if getattr(D, "opt", False):
++        _opt_observe(idx_mapping, num_sampled, num_rejected)   # and fall through: the shipped tracker runs too
+     acc = (num_sampled.to(torch.int32) - 1).clamp(min=0)
+     rows = idx_mapping.long()
+     # a request drafted shallower than its own depth has no reading at that depth: those steps don't count
+@@ -202,18 +263,146 @@
+ def _decide():
+     L = _lib()
+     W = L.mbx_d_window()
+-    ptr = D.ptr.tolist()
+-    for i, n in enumerate(ptr):
+-        if not L.mbx_d_ready(n, D.last[i]):
+-            continue
+-        k = D.depth[i]
+-        idx = torch.tensor([(n - 1 - j) % D.ring for j in range(W)], device=D.acc.device)
+-        rate = 100.0 * float(D.acc[i].index_select(0, idx)[:, k - 1].sum()) / W
+-        D.last[i] = n
+-        new = L.mbx_d_next(k, rate)
+-        if D.log:
+-            log.info("mbx depth · req %d · depth %d → %d · position %d accepted %.1f %% of the last %d steps",
+-                     i, k, new, k, rate, W)
+-        if new != k:
+-            _set(i, new)
+-            _reset(i)
++    snap = D.snap
++    if snap is not None and snap[0].query():
++        _, gens, depths = snap
++        D.snap = None
++        ptr = D.snap_ptr.tolist()
++        rates = D.snap_rate
++        for i, n in enumerate(ptr):
++            if gens[i] != D.gen[i] or depths[i] != D.depth[i]:
++                continue                    # row reset / depth changed since the snapshot: decide next time
++            if not L.mbx_d_ready(n, D.last[i]):
++                continue
++            k = D.depth[i]
++            rate = float(rates[i, k - 1])
++            D.last[i] = n
++            new = L.mbx_d_next(k, rate)
++            if D.log:
++                log.info("mbx depth · req %d · depth %d → %d · position %d accepted %.1f %% of the last %d steps",
++                         i, k, new, k, rate, W)
++            if new != k:
++                _set(i, new)
++                _reset(i)
++    if D.snap is None:
++        # rates over the last W ring entries of every row, at every depth, in one batched op
++        ring = D.ring
++        j = torch.arange(W, device=D.acc.device)
++        idx = (D.ptr[:, None] - 1 - j[None, :]) % ring                      # [R, W]
++        g = D.acc.gather(1, idx[:, :, None].expand(-1, -1, D.acc.shape[2]))  # [R, W, K]
++        D.snap_rate.copy_(g.sum(1) * (100.0 / W), non_blocking=True)
++        D.snap_ptr.copy_(D.ptr, non_blocking=True)
++        D.snap_ev.record()
++        D.snap = (D.snap_ev, list(D.gen), list(D.depth))
++
++
++# ---- OPT mode: throughput-optimal batch depth --------------------------------------------------------------------
++# tokens/step at batch depth d  =  n + sum_i sum_{k<=d} P_i(accepted >= k)
++# step time                     ~  T0(n) * (1 + cost(n) * d)        (cost(n): measured on this box, see the config)
++# d* = argmax over [min, K] of their ratio. P_i comes from an EWMA over the positions request i actually drafted,
++# shrunk toward a population prior (a new request starts from the population, not from depth 3). Every `probe`
++# steps the batch drafts two positions deeper than d* so the deep estimates stay fresh. No host sync: the GPU writes
++# the rate table to pinned memory, the next poll reads it.
++def _opt_observe(idx_mapping, num_sampled, num_rejected):
++    rows = idx_mapping.long()
++    acc = (num_sampled.to(torch.int32) - 1).clamp(min=0)
++    drafted = acc + num_rejected.to(torch.int32)                       # drafts verified this step, per request
++    obs = (D.pos[None, :] <= drafted[:, None]).to(torch.float32)        # [B, K] positions that were drafted
++    hit = ((acc[:, None] >= D.pos[None, :]).to(torch.float32)) * obs
++    lam = 1.0 - 1.0 / D.horizon
++    dec = 1.0 - obs * (1.0 - lam)                                       # decay observed positions only
++    D.num[rows] = D.num[rows] * dec + hit
++    D.den[rows] = D.den[rows] * dec + obs
++    a = 0.01                                                            # population prior: slow EWMA of counts
++    D.pop_num.mul_(1.0 - a).add_(a * hit.sum(0))
++    D.pop_den.mul_(1.0 - a).add_(a * obs.sum(0))
++    if D.steps % _POLL == 0 and not D.opt_pending:
++        D.opt_rate.copy_(_opt_rates(), non_blocking=True)
++        D.opt_ev.record()
++        D.opt_pending = True
++        D.opt_snap_gen = list(D.opt_gen)
++
++
++def _opt_rates():
++    """[R+1, K] estimates of P(accepted >= k); the last row is the population curve (for rows reset since).
++
++    Each position blends the request's own EWMA with an extrapolation: the request's previous position times its
++    last conditional acceptance (geometric continuation), itself blended with the population curve by how much the
++    request has observed. A position the batch has not drafted lately is thus estimated from the request's own
++    curve, not pinned to a conservative prior (which would keep the depth shallow and starve the deep positions).
++    """
++    pop = (D.pop_num / D.pop_den.clamp(min=1e-6)).clamp(0.0, 1.0)
++    num, den = D.num, D.den
++    R, K = num.shape
++    one = torch.ones(R, device=num.device)
++    r_prev2, r_prev = one, one
++    cols = []
++    for k in range(K):
++        if k == 0:
++            ext = pop[0].expand(R)
++        else:
++            geo = r_prev * (r_prev / r_prev2.clamp(min=1e-3)).clamp(0.0, 1.0)
++            w = den[:, k - 1] / (den[:, k - 1] + 4.0)
++            ext = w * geo + (1.0 - w) * pop[k]
++        r = (num[:, k] + 2.0 * ext) / (den[:, k] + 2.0)
++        r = torch.minimum(r, r_prev)
++        cols.append(r)
++        r_prev2, r_prev = r_prev, r
++    rate = torch.stack(cols, 1)
++    popc = torch.cummin(pop, 0).values
++    return torch.cat([rate, popc[None, :]], 0)
++
++
++def _opt_time_d(pts, d):
++    if d <= pts[0][0]:
++        (a, ta), (b, tb) = pts[0], pts[1]
++    elif d >= pts[-1][0]:
++        (a, ta), (b, tb) = pts[-2], pts[-1]
++    else:
++        for (a, ta), (b, tb) in zip(pts, pts[1:]):
++            if d <= b:
++                break
++    return ta + (tb - ta) * (d - a) / (b - a)
++
++
++def _opt_time(n, d):
++    """Relative step time at n running requests and batch depth d (interpolated from D.steptime)."""
++    tab = D.steptime
++    if n <= tab[0][0]:
++        return _opt_time_d(tab[0][1], d)
++    for (na, pa), (nb, pb) in zip(tab, tab[1:]):
++        if n <= nb:
++            w = (n - na) / (nb - na)
++            return (1 - w) * _opt_time_d(pa, d) + w * _opt_time_d(pb, d)
++    return _opt_time_d(tab[-1][1], d)
++
++
++def _opt_decide():
++    """Batch depth for the next propose: d* from the latest rate snapshot (no sync), or a probe two deeper."""
++    if D.opt_pending and D.opt_ev.query():
++        D.opt_pending = False
++        live = D.opt_live
++        if live:
++            rate = D.opt_rate
++            gens = D.opt_snap_gen
++            prior = rate[D.R].tolist()
++            n = len(live)
++            cum = [0.0] * (D.K + 1)
++            for i in live:
++                row = prior if gens is None or gens[i] != D.opt_gen[i] else rate[i].tolist()
++                run = 0.0
++                for k in range(D.K):
++                    run += row[k]
++                    cum[k + 1] += run
++            best, bd = -1.0, D.K
++            for d in range(D.dmin, D.K + 1):
++                v = (n + cum[d]) / _opt_time(n, d)
++                if v > best:
++                    best, bd = v, d
++            D.opt_d = bd
++            if D.log:
++                log.info("mbx depth opt · %d running · depth %d · expected tokens/req/step %.2f · cum %s · prior %s",
++                         n, bd, (n + cum[bd]) / n, [round(x / n, 2) for x in cum[1:]], [round(x, 2) for x in prior])
++    if D.probe and D.steps % D.probe == D.probe - 1:
++        return D.K                                                      # probe: draft every position
++    return D.opt_d

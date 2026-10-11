@@ -1,0 +1,131 @@
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -445,6 +445,11 @@
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:
++        _opt_maybe_dump(self, hidden_states)
++        if getattr(self, "_opt_dh", None) is not None:   # OPT: two-stage draft head (output-exact)
++            return self._opt_dh.logits(hidden_states, self.logits_processor.scale)
++        if getattr(self, "_opt_dv", None) is not None:
++            return _opt_draft_vocab_logits(self, hidden_states)
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -461,7 +466,115 @@
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(remap_weight_names(), mapper=mapper)
++        loaded = loader.load_weights(remap_weight_names(), mapper=mapper)
++        import os as _os
++        if _os.environ.get("OPT_MTP_FP8", "0") == "1":   # OPT: FP8 drafter projections (exact for the output)
++            import opt_fp8
++            opt_fp8.convert(self, tag=" (mtp drafter)")
++        _opt_build_draft_vocab(self)
++        self._opt_dh = None
++        if _os.environ.get("OPT_DRAFT_HEAD_BASIS"):
++            import opt_draft_head
++            from vllm.config import get_current_vllm_config
++            self._opt_dh = opt_draft_head.DraftHead(
++                str(get_current_vllm_config().model_config.model), _os.environ["OPT_DRAFT_HEAD_BASIS"],
++                next(self.parameters()).device, int(_os.environ.get("OPT_DRAFT_HEAD_K", "2048")))
++        return loaded
++
++
++def _opt_maybe_dump(model, h) -> None:
++    """Calibration (OPT_DUMP_DRAFT_H=path): save drafter hidden states (inputs of the draft lm_head) to fit the
++    two-stage draft head's basis (scripts/fit_draft_basis.py). Skips the first 2000 calls (startup, warm-up); keeps
++    up to 4 rows per call and OPT_DUMP_ROWS rows in total (default 4096)."""
++    import os as _os
++    path = _os.environ.get("OPT_DUMP_DRAFT_H")
++    if not path or torch.cuda.is_current_stream_capturing():
++        return
++    model._opt_dump_calls = getattr(model, "_opt_dump_calls", 0) + 1
++    if model._opt_dump_calls <= 2000:
++        return
++    buf = getattr(model, "_opt_dump", None)
++    if buf is None:
++        buf = model._opt_dump = []
++    cap = int(_os.environ.get("OPT_DUMP_ROWS", "4096"))
++    n = sum(x.shape[0] for x in buf)
++    if n >= cap:
++        return
++    buf.append(h[:4].detach().to("cpu", torch.bfloat16))
++    if len(buf) % 50 == 0 or n + buf[-1].shape[0] >= cap:
++        torch.save(torch.cat(buf), path)
++
++
++# ---- OPT: truncated draft vocabulary ------------------------------------------------------------------------------
++# The drafter's logits are computed only for a fixed subset of the vocabulary (OPT_DRAFT_VOCAB: a JSON list of token
++# ids) with its own small NVFP4 Marlin head, sliced from the checkpoint's lm_head; every other column is -inf. The
++# draft distribution q is then supported on the subset, and the verifier's exact rejection sampling keeps the
++# target's distribution: only acceptance changes (a target token outside the subset cannot be drafted).
++def _opt_build_draft_vocab(model) -> None:
++    import json as _json
++    import os as _os
++
++    path = _os.environ.get("OPT_DRAFT_VOCAB", "")
++    model._opt_dv = None
++    if not path:
++        return
++    from safetensors import safe_open
++
++    from vllm.config import get_current_vllm_config
++    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import prepare_fp4_layer_for_marlin
++
++    ids = sorted({int(t) for t in _json.load(open(path))})
++    mdir = str(get_current_vllm_config().model_config.model)
++    wm = _json.load(open(_os.path.join(mdir, "model.safetensors.index.json")))["weight_map"]
++    fname = _os.path.join(mdir, wm["lm_head.weight"])
++    dev = next(model.parameters()).device
++    sel = torch.tensor(ids, dtype=torch.long)
++    with safe_open(fname, framework="pt", device="cpu") as f:
++        w = f.get_tensor("lm_head.weight").index_select(0, sel)
++        sc = f.get_tensor("lm_head.weight_scale").view(torch.uint8).index_select(0, sel).view(torch.float8_e4m3fn)
++        g = f.get_tensor("lm_head.weight_scale_2")
++    head = nn.Module()
++    head.weight = nn.Parameter(w.to(dev), requires_grad=False)
++    head.weight_scale = nn.Parameter(sc.to(dev), requires_grad=False)
++    head.weight_global_scale = nn.Parameter(g.to(torch.float32).reshape(()).to(dev), requires_grad=False)
++    head.output_size_per_partition = len(ids)
++    head.input_size_per_partition = int(w.shape[1]) * 2
++    head.params_dtype = torch.bfloat16
++    prepare_fp4_layer_for_marlin(head)
++    model._opt_dv_head = head
++    model._opt_dv_ids = sel.to(dev)
++    model._opt_dv_buf = None
++    model._opt_dv_checked = False
++    model._opt_dv = len(ids)
++    print(f"OPT draft vocab: {len(ids)} of {model.logits_processor.org_vocab_size} tokens ({path})", flush=True)
++
++
++def _opt_draft_vocab_logits(model, hidden_states: torch.Tensor) -> torch.Tensor:
++    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import apply_fp4_marlin_linear
++
++    h = model._opt_dv_head
++    sub = apply_fp4_marlin_linear(
++        input=hidden_states, weight=h.weight, weight_scale=h.weight_scale,
++        weight_global_scale=h.weight_global_scale, workspace=h.workspace,
++        size_n=h.output_size_per_partition, size_k=h.input_size_per_partition)
++    scale = model.logits_processor.scale
++    if scale != 1.0:
++        sub = sub * scale
++    n = hidden_states.shape[0]
++    V = model.logits_processor.org_vocab_size
++    buf = model._opt_dv_buf
++    if buf is None or buf.shape[0] < n:
++        # persistent -inf rows: only the subset's columns are ever written
++        buf = torch.full((max(n, 128), V), float("-inf"), dtype=sub.dtype, device=sub.device)
++        model._opt_dv_buf = buf
++    out = buf[:n]
++    out.index_copy_(1, model._opt_dv_ids, sub)
++    if not model._opt_dv_checked and not torch.cuda.is_current_stream_capturing():
++        model._opt_dv_checked = True
++        ref = model.logits_processor(model.lm_head, hidden_states)
++        d = (ref.index_select(1, model._opt_dv_ids).float() - sub.float()).abs().max().item()
++        print(f"OPT draft vocab: first-call check, max |full - subset| on subset columns = {d:.3e}", flush=True)
++    return out
+ 
+ 
+ __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

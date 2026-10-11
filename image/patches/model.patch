@@ -1,0 +1,43 @@
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -1088,7 +1088,28 @@
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(weights, mapper=mapper)
++        loaded = loader.load_weights(weights, mapper=mapper)
++        import os as _os
++        if _os.environ.get("OPT_CALIB_DIR"):
++            # OPT: record the target projections' inputs on prefill for offline GPTQ (scripts/gptq_int8.py)
++            import opt_fp8
++            opt_fp8.install_recorders(self, _os.environ["OPT_CALIB_DIR"],
++                                      rows=int(_os.environ.get("OPT_CALIB_ROWS", "4096")),
++                                      per_call=int(_os.environ.get("OPT_CALIB_PER_CALL", "160")))
++        if _os.environ.get("OPT_TARGET_FP8", "0") == "1":
++            # OPT (opt-in, changes numerics): the target's large bf16 projections as FP8 e4m3 per-channel (Marlin
++            # W8A16). Router, shared-expert gate, lm_head, embeddings and the vision tower stay as they are.
++            import opt_fp8
++            inc = _os.environ.get("OPT_TARGET_FP8_INCLUDE", "")
++            exc = _os.environ.get("OPT_TARGET_FP8_EXCLUDE", "")
++            fmt = _os.environ.get("OPT_TARGET_QFMT", "fp8")          # fp8 | int8
++            grp = int(_os.environ.get("OPT_TARGET_QGROUP", "128"))   # int8 group along K (-1 = per row)
++            cpath = _os.environ.get("OPT_TARGET_QCODES", "")        # offline (GPTQ) int8 codes {module: [N, K]}
++            codes = _torch_load_codes(cpath) if cpath else None
++            opt_fp8.convert(self, include=[x for x in inc.split(",") if x] or None,
++                            exclude=("router", "lm_head", "embed", "visual") + tuple(x for x in exc.split(",") if x),
++                            tag=" (target)", fmt=fmt, group=grp, codes=codes)
++        return loaded
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(
+@@ -1133,3 +1154,10 @@
+     "Qwen4ExpModel",
+     "Qwen4ExpSparseMoeBlock",
+ ]
++
++
++def _torch_load_codes(path):
++    """OPT: offline INT8 codes for the target's projections: {vLLM module name: int8 tensor [N, K]}."""
++    import torch as _t
++    d = _t.load(path, map_location="cpu")
++    return {k: v for k, v in d.items()}
